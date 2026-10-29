@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { FormField, FormSettings } from '../types';
+import { FormField, FormSettings, FILE_DEFAULTS } from '../types';
 import { FormTheme, DEFAULT_THEME, resolveThemeVars, PaletteKey } from '../theme';
 import { FORM_CSS } from '../form-css';
 import { C, FF } from '../ui';
@@ -77,6 +77,25 @@ function Group({ title, children }: { title: string; children: React.ReactNode }
 function PreviewInput({ field }: { field: FormField }) {
   const t = useT();
   const ph = field.placeholder || '';
+  if (field.type === 'file') {
+    const maxMb = field.maxSizeMb || FILE_DEFAULTS.maxSizeMb;
+    const maxCnt = field.multiple ? (field.maxFiles || FILE_DEFAULTS.maxFiles) : 1;
+    return (
+      <div>
+        <input
+          className="sfb-input sfb-file-input"
+          type="file"
+          accept={field.accept || FILE_DEFAULTS.accept}
+          multiple={!!field.multiple}
+        />
+        <p className="sfb-file-meta">
+          {field.multiple
+            ? t('preview.fileConstraintMultiple', { size: maxMb, count: maxCnt })
+            : t('preview.fileConstraintSingle', { size: maxMb })}
+        </p>
+      </div>
+    );
+  }
   if (field.type === 'textarea') return <textarea className="sfb-input" placeholder={ph} readOnly />;
   if (field.type === 'select') return (
     <select className="sfb-input"><option>{ph || t('preview.selectOption')}</option></select>

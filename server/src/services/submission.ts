@@ -1,3 +1,12 @@
+import {
+  formatFileCellForCsv,
+  isUploadedFileList,
+  RawUploadedFile,
+  SanitizedFileForStrapi,
+  UploadedFileItem,
+  validateUploadedFilesForField,
+} from '../lib/file-upload';
+
 const PLUGIN_ID = 'strapi-plugin-form-builder-cms';
 const SUBMISSION_UID = `plugin::${PLUGIN_ID}.form-submission`;
 const FORM_UID = `plugin::${PLUGIN_ID}.form`;
@@ -59,7 +68,8 @@ export default ({ strapi }: { strapi: any }) => ({
   async submit(
     slug: string,
     body: Record<string, any>,
-    meta: { ip: string; userAgent: string }
+    meta: { ip: string; userAgent: string },
+    filesByField: Record<string, RawUploadedFile[]> = {}
   ) {
     const form = await strapi
       .plugin(PLUGIN_ID)
@@ -77,8 +87,29 @@ export default ({ strapi }: { strapi: any }) => ({
     const pd = form.publishedData || { fields: form.fields, settings: form.settings };
     const live = { fields: pd.fields || [], settings: pd.settings || {} };
 
+    const allFields: any[] = live.fields || [];
+    const fileFields = allFields.filter((f: any) => f.type === 'file');
+    const nonFileFields = allFields.filter((f: any) => f.type !== 'file');
+
+    // Prevent JSON body spoofing of file fields: file values can only originate from validated multipart uploads
+    const sanitizedBody: Record<string, any> = { ...(body || {}) };
+    for (const ff of fileFields) {
+      delete sanitizedBody[ff.name];
+    }
+
     const validationService = strapi.plugin(PLUGIN_ID).service('validation');
-    const result = validationService.validate(live.fields, body);
+    const result = validationService.validate(nonFileFields, sanitizedBody);
+
+    const sanitizedFilesByField: Record<string, SanitizedFileForStrapi[]> = {};
+    for (const ff of fileFields) {
+      const fileResult = validateUploadedFilesForField(ff, filesByField?.[ff.name]);
+      if (!fileResult.valid) {
+        result.valid = false;
+        result.errors[ff.name] = fileResult.errors;
+      } else {
+        sanitizedFilesByField[ff.name] = fileResult.sanitizedFiles;
+      }
+    }
 
     if (!result.valid) {
       const err: any = new Error('Validation failed');
@@ -88,14 +119,14 @@ export default ({ strapi }: { strapi: any }) => ({
     }
 
     // Honeypot check — bot filled the hidden trap field, pretend success and drop it
-    if (live.settings?.enableHoneypot && body._fc_hp) {
+    if (live.settings?.enableHoneypot && sanitizedBody._fc_hp) {
       return { success: true, successMessage: live.settings?.successMessage };
     }
 
     // CAPTCHA — verify the challenge token against the provider before accepting
     const captcha = live.settings?.captcha;
     if (captcha && captcha.provider && captcha.provider !== 'none' && captcha.secretKey) {
-      const ok = await verifyCaptcha(captcha.provider, captcha.secretKey, body._fc_captcha, meta.ip);
+      const ok = await verifyCaptcha(captcha.provider, captcha.secretKey, sanitizedBody._fc_captcha, meta.ip);
       if (!ok) {
         const err: any = new Error('Captcha verification failed. Please try again.');
         err.name = 'CaptchaError';
@@ -119,16 +150,94 @@ export default ({ strapi }: { strapi: any }) => ({
     }
 
     // strip honeypot + captcha token before persisting so they never land in stored data
-    const { _fc_hp, _fc_captcha, ...clean } = body;
+    const { _fc_hp, _fc_captcha, ...clean } = sanitizedBody;
 
     // Freeze the field schema used at submit time so the record stays accurate
     // even if the form's fields are later added, removed or renamed.
     const decorative = ['heading', 'paragraph', 'divider'];
-    const fieldsSnapshot = (live.fields || [])
+    const fieldsSnapshot = allFields
       .filter((f: any) => !decorative.includes(f.type))
-      .map((f: any) => ({ name: f.name, label: f.label, type: f.type, order: f.order, options: f.options }));
+      .map((f: any) => ({
+        name: f.name,
+        label: f.label,
+        type: f.type,
+        order: f.order,
+        options: f.options,
+        ...(f.type === 'file'
+          ? {
+              accept: f.accept,
+              maxSizeMb: f.maxSizeMb,
+              multiple: f.multiple,
+              maxFiles: f.maxFiles,
+            }
+          : {}),
+      }));
+
+    const uploadedMediaRecords: any[] = [];
+    const uploadPlugin = strapi.plugin?.('upload');
+    const uploadService = uploadPlugin?.service?.('upload');
+    const folderService = uploadPlugin?.service?.('api-upload-folder');
 
     try {
+      if (fileFields.length > 0) {
+        let folderId: number | null = null;
+        if (folderService?.getAPIUploadFolder) {
+          try {
+            const folder = await folderService.getAPIUploadFolder();
+            folderId = folder?.id ?? null;
+          } catch {
+            folderId = null;
+          }
+        }
+
+        for (const ff of fileFields) {
+          const sanitizedList = sanitizedFilesByField[ff.name] || [];
+          if (sanitizedList.length === 0) {
+            clean[ff.name] = [];
+            continue;
+          }
+          if (!uploadService?.upload) {
+            throw new Error('Strapi upload service is not available');
+          }
+
+          const uploadedItems: UploadedFileItem[] = [];
+          for (const sf of sanitizedList) {
+            const uploaded = await uploadService.upload({
+              data: {
+                fileInfo: {
+                  name: sf.displayName,
+                  caption: `${form.slug} - ${ff.label || ff.name}`,
+                  alternativeText: sf.displayName,
+                  ...(folderId ? { folder: folderId } : {}),
+                },
+              },
+              files: {
+                filepath: sf.filepath,
+                originalFilename: sf.originalFilename,
+                mimetype: sf.mimetype,
+                detectedMimeType: sf.detectedMimeType,
+                size: sf.size,
+              },
+            });
+
+            const rec = Array.isArray(uploaded) ? uploaded[0] : uploaded;
+            if (rec) {
+              uploadedMediaRecords.push(rec);
+              uploadedItems.push({
+                id: rec.id,
+                ...(rec.documentId ? { documentId: rec.documentId } : {}),
+                name: sf.displayName,
+                url: String(rec.url || ''),
+                mime: String(rec.mime || sf.mimetype),
+                size: sf.size,
+                ext: sf.ext,
+              });
+            }
+          }
+          clean[ff.name] = uploadedItems;
+        }
+      }
+
       await strapi.db.query(SUBMISSION_UID).create({
         data: {
           form: form.id,
@@ -140,6 +249,16 @@ export default ({ strapi }: { strapi: any }) => ({
         },
       });
     } catch (createErr: any) {
+      // Roll back any Media Library files uploaded during this request so no orphans remain
+      if (uploadedMediaRecords.length > 0 && uploadService?.remove) {
+        for (const rec of uploadedMediaRecords) {
+          try {
+            await uploadService.remove(rec);
+          } catch {
+            // best-effort rollback
+          }
+        }
+      }
       console.error('[sfb] create error:', createErr?.message, createErr?.stack);
       throw createErr;
     }
@@ -209,7 +328,10 @@ export default ({ strapi }: { strapi: any }) => ({
       s.id,
       s.status,
       s.createdAt,
-      ...fieldNames.map((name: string) => s.data?.[name] ?? ''),
+      ...fieldNames.map((name: string) => {
+        const val = s.data?.[name];
+        return isUploadedFileList(val) ? formatFileCellForCsv(val) : (val ?? '');
+      }),
     ]);
 
     // ponytail: CSV only. Add xlsx with a real writer (exceljs) if someone actually needs it.

@@ -1,5 +1,5 @@
 import { FORM_CSS } from '../../../admin/src/form-css';
-import { isSafeRedirect } from '../lib/embed';
+import { isSafeRedirect, validateClientFiles } from '../lib/embed';
 
 const PLUGIN_ID = 'strapi-plugin-form-builder-cms';
 
@@ -76,6 +76,7 @@ function embedScript(): string {
   return `(function () {
   var PLUGIN = 'strapi-plugin-form-builder-cms';
   var isSafeRedirect = ${isSafeRedirect.toString()};
+  var validateClientFiles = ${validateClientFiles.toString()};
 
   function init() {
     document.querySelectorAll('script[data-form-id]').forEach(function (script) {
@@ -185,9 +186,12 @@ function embedScript(): string {
       btn.disabled = true;
       btn.textContent = 'Sending…';
 
-      // collect form data, handling checkbox-group arrays
+      var hasFileFields = (form.fields || []).some(function (f) { return f.type === 'file'; });
+
+      // collect non-file form data, handling checkbox-group arrays
       var data = {};
       new FormData(formEl).forEach(function (v, k) {
+        if (typeof File !== 'undefined' && v instanceof File) return;
         if (k.endsWith('[]')) {
           var name = k.slice(0, -2);
           if (!data[name]) data[name] = [];
@@ -196,6 +200,22 @@ function embedScript(): string {
           data[k] = v;
         }
       });
+
+      var filesByField = {};
+      if (hasFileFields) {
+        formEl.querySelectorAll('input[type="file"]').forEach(function (inp) {
+          var list = inp.files ? Array.prototype.slice.call(inp.files) : [];
+          filesByField[inp.name] = list;
+        });
+
+        var clientErrors = validateClientFiles(form.fields || [], filesByField);
+        if (Object.keys(clientErrors).length > 0) {
+          btn.disabled = false;
+          btn.textContent = submitText;
+          showFieldErrors(clientErrors);
+          return;
+        }
+      }
 
       // normalize the provider's token field to a single key the server expects
       if (captchaOn) {
@@ -215,11 +235,28 @@ function embedScript(): string {
         }
       }
 
-      fetch(base + '/api/' + PLUGIN + '/forms/' + form.slug + '/submit', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ data: data }),
-      })
+      var fetchOptions;
+      if (hasFileFields) {
+        var multipart = new FormData();
+        multipart.append('data', JSON.stringify(data));
+        Object.keys(filesByField).forEach(function (fieldName) {
+          (filesByField[fieldName] || []).forEach(function (fileObj) {
+            multipart.append('files.' + fieldName, fileObj);
+          });
+        });
+        fetchOptions = {
+          method: 'POST',
+          body: multipart,
+        };
+      } else {
+        fetchOptions = {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: data }),
+        };
+      }
+
+      fetch(base + '/api/' + PLUGIN + '/forms/' + form.slug + '/submit', fetchOptions)
         .then(function (r) {
           return r.json().then(function (body) {
             if (!r.ok) return Promise.reject(body);
@@ -243,8 +280,7 @@ function embedScript(): string {
           msg.className = 'sfb-success';
           msg.textContent = (form.settings && form.settings.successMessage) || 'Form submitted successfully';
           wrap.appendChild(msg);
-          el.innerHTML = '';
-          el.appendChild(wrap);
+          el.replaceChildren(wrap);
         })
         .catch(function (body) {
           btn.disabled = false;
@@ -263,8 +299,7 @@ function embedScript(): string {
         });
     });
 
-    el.innerHTML = '';
-    el.appendChild(formEl);
+    el.replaceChildren(formEl);
   }
 
   function renderField(field) {
@@ -331,6 +366,27 @@ function embedScript(): string {
 
   function buildInput(field) {
     var id = 'sfb-' + field.id;
+
+    if (field.type === 'file') {
+      var fileWrap = document.createElement('div');
+      var fi = document.createElement('input');
+      fi.type = 'file';
+      fi.id = id;
+      fi.name = field.name;
+      fi.className = 'sfb-input sfb-file-input';
+      fi.accept = field.accept || '.pdf,.png,.jpg,.jpeg,.webp,.doc,.docx';
+      if (field.multiple) fi.multiple = true;
+      fi.required = !!field.required;
+      fileWrap.appendChild(fi);
+
+      var meta = document.createElement('p');
+      meta.className = 'sfb-file-meta';
+      var maxMb = field.maxSizeMb || 5;
+      var maxCnt = field.multiple ? (field.maxFiles || 3) : 1;
+      meta.textContent = 'Max ' + maxMb + ' MB' + (field.multiple ? ' per file (up to ' + maxCnt + ' files)' : '');
+      fileWrap.appendChild(meta);
+      return fileWrap;
+    }
 
     if (field.type === 'textarea') {
       var ta = document.createElement('textarea');
@@ -432,11 +488,10 @@ function embedScript(): string {
     function fail() {
       if (failed) return;
       failed = true;
-      box.innerHTML = '';
       var m = document.createElement('p');
       m.className = 'sfb-error';
       m.textContent = 'Verification could not load. Please contact the site owner.';
-      box.appendChild(m);
+      box.replaceChildren(m);
     }
     // fallback: an invalid site key renders nothing and fires no error — flag it after a grace period
     function guard() { setTimeout(function () { if (!box.querySelector('iframe')) fail(); }, 5000); }
